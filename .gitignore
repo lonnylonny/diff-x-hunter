@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# scratch and plan
+/.scratch/
+
+# personal agent rules
+/AGENTS.md
+/docs/agents/
+
+# system
+.DS_Store
+
+#privacy
+.env
