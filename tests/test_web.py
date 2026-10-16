@@ -56,8 +56,50 @@ class WatchConfigWebTests(unittest.TestCase):
         )
         self.mcp_query = query_patcher.start()
         self.addCleanup(query_patcher.stop)
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers={"Origin": "http://testserver"})
         self.addCleanup(self.client.close)
+
+    def test_same_origin_and_referer_fallback_allow_submission(self) -> None:
+        cases = (
+            {"Origin": "http://testserver", "Referer": "https://other.example/"},
+            {"Referer": "http://testserver/?view=configs"},
+        )
+        with TestClient(app) as client:
+            for headers in cases:
+                with self.subTest(headers=headers):
+                    response = client.post(
+                        "/watch-configs", headers=headers,
+                        data={"repository": "example/demo"}, follow_redirects=False,
+                    )
+                    self.assertEqual(response.status_code, 303)
+        self.assertEqual(len(load_configs()), len(cases))
+        self.assertEqual(self.mcp_query.await_count, len(cases))
+
+    def test_cross_origin_or_missing_source_does_not_save_or_query(self) -> None:
+        cases = (
+            {},
+            {"Origin": "https://attacker.example", "Sec-Fetch-Site": "cross-site"},
+            {"Origin": "https://attacker.example", "Referer": "http://testserver/"},
+            {"Origin": "null", "Referer": "http://testserver/"},
+            {"Origin": "http://testserver.attacker.example"},
+            {"Origin": "https://testserver"},
+            {"Origin": "http://testserver:8001"},
+            {"Referer": "https://attacker.example/"},
+            {"Origin": "http://["},
+        )
+        with TestClient(app) as client:
+            for headers in cases:
+                with self.subTest(headers=headers):
+                    response = client.post(
+                        "/watch-configs", headers=headers,
+                        data={"repository": "example/demo"},
+                    )
+                    self.assertEqual(response.status_code, 403)
+                    self.assertIn("请从本应用页面提交", response.text)
+        self.assertEqual(load_configs(), [])
+        self.assertEqual(load_releases("example/demo"), [])
+        self.assertEqual(load_tool_calls(), [])
+        self.mcp_query.assert_not_awaited()
 
     def test_save_redirect_and_reload(self) -> None:
         self.assertIn("还没有关注配置", self.client.get("/").text)
@@ -235,6 +277,7 @@ class WatchConfigWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn("配置已保存，但查询或结果保存失败", response.text)
         self.assertNotIn("private release failure", response.text)
+        self.assertIn("失败环节：保存结果", response.text)
         self.assertEqual(load_configs(), [("astral-sh/uv", "")])
         self.assertEqual(load_releases("astral-sh/uv"), [])
         calls = load_tool_calls()
@@ -417,7 +460,7 @@ from diff_x_hunter import storage
 from diff_x_hunter.web import app
 storage.DB_PATH = Path(sys.argv[1])
 result = CallToolResult(content=[], structured_content={"result": [json.loads(sys.argv[3])]})
-with patch('diff_x_hunter.github_mcp.list_releases', new=AsyncMock(return_value=result)) as query, TestClient(app) as client:
+with patch('diff_x_hunter.github_mcp.list_releases', new=AsyncMock(return_value=result)) as query, TestClient(app, headers={'Origin': 'http://testserver'}) as client:
     if sys.argv[2] == 'save':
         response = client.post('/watch-configs', data={
             'repository': 'astral-sh/uv', 'focus': '重启后保留'
@@ -514,6 +557,35 @@ with patch('diff_x_hunter.github_mcp.list_releases', new=AsyncMock()) as query, 
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(load_tool_calls(), calls_before)
+
+    def test_unrecorded_failure_overrides_old_success_in_current_response(self) -> None:
+        self.client.post("/watch-configs", data={"repository": "example/demo"})
+        releases_before = load_releases("example/demo")
+        calls_before = load_tool_calls()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_call BEFORE INSERT ON tool_calls "
+                "BEGIN SELECT RAISE(ABORT, 'private write failure'); END"
+            )
+        self.mcp_query.side_effect = TimeoutError("private timeout")
+        response = self.client.post(
+            "/watch-configs", data={"repository": " Example/Demo "},
+        )
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("本次失败记录未能保存", response.text)
+        self.assertIn("<h4>本次查询</h4>", response.text)
+        self.assertIn("以下为此前保存的资料，不代表本次查询成功", response.text)
+        self.assertIn("<h4>v1.0.0</h4>", response.text)
+        self.assertNotIn("配置及查询结果已保存", response.text)
+        self.assertNotIn("private", response.text)
+
+        page = self.client.get("/")
+        self.assertIn("<h4>最近一次已保存的查询结论</h4>", page.text)
+        self.assertIn("配置及查询结果已保存", page.text)
+        self.assertNotIn("<h4>最近一次查询</h4>", page.text)
+        self.assertEqual(load_releases("example/demo"), releases_before)
+        self.assertEqual(load_tool_calls(), calls_before)
+        self.assertEqual(self.mcp_query.await_count, 2)
 
     def test_saved_failure_reasons_are_visible_after_reload(self) -> None:
         cases = (

@@ -1,3 +1,4 @@
+# 通过 GitHub MCP 分页查询，保存最新已发布版本及调用记录。
 import asyncio
 import json
 import os
@@ -17,6 +18,7 @@ QUERY_TIMEOUT_SECONDS = 60
 
 @dataclass(frozen=True)
 class QueryResult:
+    # 整次查询结论：找到、为空、不可访问或失败。
     outcome: Literal["found", "empty", "inaccessible", "failed"]
     release: dict | None = None
     reason_code: str | None = None
@@ -27,13 +29,13 @@ class ToolQueryError(RuntimeError):
 
 
 def classify_failure(exc: Exception, stage: str, owner: str, repo: str) -> QueryResult:
+    # 结合失败环节和异常，生成可展示的原因码。
     if stage == "save":
         return QueryResult("failed", reason_code="save_failed")
     if isinstance(exc, TimeoutError):
         return QueryResult("failed", reason_code="timeout")
     if isinstance(exc, (ToolQueryError, MCPError)):
-        # Official ListReleases wraps go-github errors with this prefix. Require
-        # the exact requested endpoint; a stray "404" is not access evidence.
+        # 精确匹配当前接口的错误，避免误判无关的 404。
         endpoint = re.escape(f"https://api.github.com/repos/{owner}/{repo}/releases")
         match = re.fullmatch(
             rf"failed to list releases: GET {endpoint}(?:\?[^\s:]*)?: "
@@ -54,6 +56,7 @@ def classify_failure(exc: Exception, stage: str, owner: str, repo: str) -> Query
 
 
 def safe_error(exc: Exception) -> str:
+    # 写日志前隐藏令牌，避免凭据入库。
     message = str(exc)
     token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
     if token:
@@ -61,12 +64,13 @@ def safe_error(exc: Exception) -> str:
     message = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)",
                      "[REDACTED]", message)
     message = re.sub(r"(?i)\b(Bearer|token)\s+[^\s,;]+", r"\1 [REDACTED]", message)
-    # Preserve the established diagnostic type for tool errors.
+    # 工具错误沿用原有的诊断类型名。
     name = "RuntimeError" if isinstance(exc, ToolQueryError) else type(exc).__name__
     return f"{name}: {message}"
 
 
 async def list_releases(owner: str, repo: str, page: int) -> CallToolResult:
+    # 将凭据及工具配置传给 Docker 中的 MCP 服务。
     env = {
         name: os.environ[name]
         for name in (
@@ -88,6 +92,7 @@ async def list_releases(owner: str, repo: str, page: int) -> CallToolResult:
         env=env,
     )
 
+    # 建立标准输入输出连接，读取指定页。
     async with Client(server, raise_exceptions=True) as client:
         return await client.call_tool(
             "list_releases",
@@ -96,17 +101,19 @@ async def list_releases(owner: str, repo: str, page: int) -> CallToolResult:
 
 
 def parse_releases(result: CallToolResult) -> list[dict]:
+    # 工具报错直接抛出，不按版本数据处理。
     if result.is_error:
         message = "\n".join(
             block.text for block in result.content if block.type == "text"
         )
         raise ToolQueryError(message or "GitHub MCP 查询失败")
+    # 优先取结构化数据，否则解析文本中的 JSON。
     data = result.structured_content
     if data is None:
         data = json.loads(next(
             block.text for block in result.content if block.type == "text"
         ))
-    # MCP structured array results may be wrapped in an object.
+    # 兼容数组包在 result 字段中的响应。
     if isinstance(data, dict) and "result" in data:
         data = data["result"]
     if not isinstance(data, list):
@@ -120,6 +127,7 @@ async def query_release(owner: str, repo: str) -> QueryResult:
     latest_key = None
     page = 1
     loop = asyncio.get_running_loop()
+    # 所有分页共用截止时间，限制总等待时长。
     deadline = loop.time() + QUERY_TIMEOUT_SECONDS
     while True:
         arguments = {"owner": owner, "repo": repo, "page": page, "perPage": PAGE_SIZE}
@@ -130,11 +138,12 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                 raise TimeoutError("查询等待期限已到")
             async with asyncio.timeout_at(deadline):
                 response = await list_releases(owner, repo, page)
-            # is_error reports a failed tool call, not a successful response to parse.
+            # 工具报错归入查询环节。
             if response.is_error:
                 parse_releases(response)
             stage = "parse"
             releases = parse_releases(response)
+            # 跳过草稿，校验后续排序和存储所需字段。
             for release in releases:
                 if not isinstance(release["draft"], bool):
                     raise ValueError("Release 草稿标记无效")
@@ -152,12 +161,13 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                     raise ValueError("Release 发布时间缺少时区")
                 if not isinstance(release["prerelease"], bool):
                     raise ValueError("Release 类型无效")
-                # IDs break ties only; version labels and list order do not.
+                # 按发布时间选最新版本，同一时间用 ID 比较。
                 key = (published_at, release["id"])
                 if latest_key is None or key > latest_key:
                     latest, latest_key = release, key
 
             stage = "save"
+            # 不满一页表示遍历完成，此时才确定整次结论。
             finished = len(releases) < PAGE_SIZE
             outcome = ("empty" if latest is None else "found") if finished else None
             summary = f"第 {page} 页：取得 {len(releases)} 条 Release"
@@ -166,6 +176,7 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                 if latest is None:
                     summary += "；查询完成，暂无已发布版本"
                 else:
+                    # 全部分页完成后，仅保存选中的版本。
                     body = latest.get("body") or ""
                     release_id = save_release(
                         repository=f"{owner}/{repo}",
@@ -181,6 +192,7 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                         f"；查询完成，选定 {latest['tag_name']}（{kind}），"
                         f"发布说明 {len(body)} 字符"
                     )
+            # 每页留痕，最后一页关联版本和整次结论。
             save_tool_call(
                 tool_name="list_releases", arguments=arguments,
                 called_at=called_at, status="success",
@@ -188,6 +200,7 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                 query_outcome=outcome,
             )
         except Exception as exc:
+            # 记录失败原因和发生环节，错误信息先脱敏。
             result = classify_failure(exc, stage, owner, repo)
             try:
                 save_tool_call(
@@ -197,9 +210,11 @@ async def query_release(owner: str, repo: str) -> QueryResult:
                     failure_stage=stage,
                 )
             except Exception:
+                # 连失败记录也未保存时，通知上层页面。
                 exc.add_note("本次失败记录未能保存")
                 raise exc
             if stage == "save":
+                # 保存失败交给调用方处理，不能当作正常结果。
                 raise
             return result
 
